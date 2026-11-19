@@ -1,0 +1,64 @@
+{
+  "name": "ledger-agent",
+  "version": "0.1.0",
+  "description": "An LLM agent that categorizes Brazilian bank transactions (Pix, boleto, card). Deterministic passes first, the model only for what is left, guards after it, and a golden-set eval to compare prompts and models.",
+  "license": "MIT",
+  "author": "Raul Gomes",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/FirstRaulGG/ledger-agent.git"
+  },
+  "homepage": "https://github.com/FirstRaulGG/ledger-agent#readme",
+  "bugs": {
+    "url": "https://github.com/FirstRaulGG/ledger-agent/issues"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "ledger-agent": "dist/cli.js"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "fixtures",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "dev": "tsx src/cli.ts",
+    "demo": "tsx src/cli.ts demo",
+    "eval": "tsx src/cli.ts eval",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "check": "npm run lint && npm run typecheck && npm run test"
+  },
+  "keywords": [
+    "llm",
+    "agent",
+    "bank-transactions",
+    "categorization",
+    "pix",
+    "pii",
+    "guardrails",
+    "evals",
+    "claude"
+  ],
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.10.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.6.6",
+    "eslint": "^10.15.0",
+    "tsx": "^4.23.15",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.73.0",
+    "vitest": "^5.1.1"
+  }
+}
