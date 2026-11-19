@@ -71,7 +71,7 @@ export function defineTaxonomy(spec: TaxonomySpec): Taxonomy {
   const byId = new Map<string, Category>();
   const byName = new Map<string, Category>();
   for (const category of spec.categories) {
-    if (!/^[a-z0-9_]+$/.test(category.id)) throw new Error(`category id "${category.id}" must be lower-case letters, digits and underscores`);
+    if (!/^[a-z][a-z0-9_]*$/.test(category.id)) throw new Error(`category id "${category.id}" must start with a letter and use lower-case letters, digits and underscores`);
     if (byId.has(category.id)) throw new Error(`duplicate category id "${category.id}"`);
     const name = normalizeName(category.name);
     if (!name) throw new Error(`category "${category.id}" has no name`);

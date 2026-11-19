@@ -17,7 +17,7 @@ export * from "./agent/cost.js";
 export * from "./agent/run.js";
 
 export * from "./llm/types.js";
-export { ClaudeClient, DEFAULT_CLAUDE_MODEL } from "./llm/claude.js";
+export { ClaudeClient } from "./llm/claude.js";
 export type { ClaudeClientOptions } from "./llm/claude.js";
 export { OpenAiCompatibleClient } from "./llm/openai-compatible.js";
 export type { OpenAiCompatibleOptions } from "./llm/openai-compatible.js";

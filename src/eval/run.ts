@@ -4,6 +4,7 @@
 // runs a golden set through the real pipeline (same passes, same parser, same guards) and reports
 // a number, so that a prompt or a model is swapped with evidence and not with a hunch.
 
+import { estimateCost } from "../agent/cost.js";
 import type { PriceTable } from "../agent/cost.js";
 import { visibleText } from "../agent/prompt.js";
 import { categorize } from "../agent/run.js";
@@ -40,11 +41,23 @@ export interface EvalOptions {
    * vote and the report includes how often the samples agreed. Default 1.
    */
   samples?: number;
-  /** A second model that scores each reason from 1 to 5. It never changes whether a case counts as correct. */
+  /**
+   * A model that scores each of the evaluated model's reasons from 1 to 5. It never changes
+   * whether a case counts as correct. Use a different model from the one being evaluated: a model
+   * grading its own reasoning mostly agrees with itself.
+   */
   judge?: LlmClient;
+  /**
+   * Lowest confidence at which an answer counts as written. Default `low`: every answer counts,
+   * and the report breaks accuracy down by confidence so that a threshold can be chosen from it.
+   * Set it to what you run in production to see what would actually be written.
+   */
+  applyAt?: Confidence;
   context?: string;
   batchSize?: number;
   holder?: Holder;
+  tradeWords?: readonly string[];
+  maskCompanyIds?: boolean;
 }
 
 export interface CaseResult {
@@ -60,6 +73,8 @@ export interface CaseResult {
   confidence: Confidence | null;
   reason: string;
   guard?: string;
+  /** The reason is the model's own words, not fixed text written by a rule. */
+  authored: boolean;
   judge?: { score: number | null; critique: string };
 }
 
@@ -88,7 +103,7 @@ export interface EvalReport {
   usage: LlmUsage;
   costUsd: number | null;
   llmUnavailable: boolean;
-  judge?: { mean: number | null; scored: number; unreadable: number; usage: LlmUsage };
+  judge?: { model: string; mean: number | null; scored: number; unreadable: number; usage: LlmUsage; costUsd: number | null; failed: boolean };
   cases: CaseResult[];
 }
 
@@ -120,7 +135,11 @@ function transactionsFor(cases: readonly GoldenCase[]): Transaction[] {
   return transactions;
 }
 
-/** The most frequent value. On a tie the one seen first wins, so the result does not depend on chance. */
+/**
+ * The most frequent value. On a tie the one seen first wins, so the result does not depend on
+ * chance; with two samples that is always the first, so use an odd number. "Nothing written" is a
+ * value like any other: two abstentions outvote one answer.
+ */
 export function majority<T>(votes: readonly T[]): { winner: T; share: number } {
   const counts = new Map<T, number>();
   for (const vote of votes) counts.set(vote, (counts.get(vote) ?? 0) + 1);
@@ -170,7 +189,11 @@ export async function runEval(cases: readonly GoldenCase[], options: EvalOptions
   let costUsd: number | null = 0;
   let llmUnavailable = false;
   let model = "";
-  const perSample: Map<string, { got: string | null; stage: Stage; confidence: Confidence | null; reason: string; guard?: string }>[] = [];
+  const perSample: Map<string, { got: string | null; stage: Stage; confidence: Confidence | null; reason: string; guard?: string; authored: boolean }>[] = [];
+  const caseOf = new Map<string, string>();
+  cases.forEach((golden) => {
+    for (let k = 0; k < 12; k += 1) caseOf.set(`${golden.id}#${k}`, golden.id);
+  });
 
   for (let sample = 0; sample < samples; sample += 1) {
     const report = await categorize(
@@ -182,9 +205,11 @@ export async function runEval(cases: readonly GoldenCase[], options: EvalOptions
         prices: options.prices,
         context: options.context,
         batchSize: options.batchSize,
-        // Every answer counts, whatever its confidence: the eval measures the answer, and reports
-        // accuracy by confidence so that the threshold can be chosen from data.
-        applyAt: "low",
+        applyAt: options.applyAt ?? "low",
+        tradeWords: options.tradeWords,
+        maskCompanyIds: options.maskCompanyIds,
+        // Each case is its own group, even when two cases share a counterparty.
+        partition: (tx) => caseOf.get(tx.id) ?? tx.id,
         maxMs: 10 * 60_000,
         callTimeoutMs: 120_000,
       },
@@ -206,6 +231,7 @@ export async function runEval(cases: readonly GoldenCase[], options: EvalOptions
               confidence: decision.confidence,
               reason: decision.reason,
               ...(decision.guard ? { guard: decision.guard } : {}),
+              authored: decision.stage === "model" && (decision.categoryId !== null || decision.guard !== undefined),
             },
           ];
         }),
@@ -229,6 +255,7 @@ export async function runEval(cases: readonly GoldenCase[], options: EvalOptions
       confidence: source.confidence,
       reason: source.reason,
       ...(source.guard ? { guard: source.guard } : {}),
+      authored: source.authored,
     };
   });
 
@@ -238,12 +265,15 @@ export async function runEval(cases: readonly GoldenCase[], options: EvalOptions
     let sum = 0;
     let scored = 0;
     let unreadable = 0;
+    let failed = false;
+    let judgeModel = "";
     const byId = new Map(cases.map((golden) => [golden.id, golden]));
     for (const result of results) {
-      // Only the model's own answers have a reason worth judging; rule-based ones are fixed text.
-      if (result.stage !== "model") continue;
+      // Only the model's own words are worth judging. Rule-based reasons are fixed text.
+      if (!result.authored) continue;
       const golden = byId.get(result.id)!;
-      const reply = await options.judge.complete([
+      const reply = await options.judge
+        .complete([
         { role: "system", content: JUDGE_SYSTEM },
         {
           role: "user",
@@ -255,7 +285,14 @@ export async function runEval(cases: readonly GoldenCase[], options: EvalOptions
             reason: result.reason,
           }),
         },
-      ]);
+      ], { signal: AbortSignal.timeout(120_000) })
+        .catch(() => null);
+      // The grading is already done. A judge that goes away must not take the report with it.
+      if (!reply) {
+        failed = true;
+        break;
+      }
+      judgeModel = reply.model;
       judgeUsage = addUsage(judgeUsage, reply.usage);
       const parsed = extractJson(reply.text) as { score?: unknown; critique?: unknown } | null;
       const score = typeof parsed?.score === "number" && parsed.score >= 1 && parsed.score <= 5 ? parsed.score : null;
@@ -266,12 +303,13 @@ export async function runEval(cases: readonly GoldenCase[], options: EvalOptions
       }
       result.judge = { score, critique: typeof parsed?.critique === "string" ? parsed.critique.slice(0, 300) : "" };
     }
-    judge = { mean: scored ? sum / scored : null, scored, unreadable, usage: judgeUsage };
+    judge = { model: judgeModel, mean: scored ? sum / scored : null, scored, unreadable, usage: judgeUsage, costUsd: judgeModel ? estimateCost(judgeUsage, judgeModel, options.prices) : null, failed };
   }
 
-  const byCategory: Record<string, Tally> = {};
-  const byStage: Record<string, Tally> = {};
-  const byConfidence: Record<string, Tally> = {};
+  // No prototype: a category may be called "constructor".
+  const byCategory = Object.create(null) as Record<string, Tally>;
+  const byStage = Object.create(null) as Record<string, Tally>;
+  const byConfidence = Object.create(null) as Record<string, Tally>;
   const confusion = new Map<string, { expected: string; got: string | null; count: number }>();
   const modelOnly: Tally = { total: 0, correct: 0 };
   for (const result of results) {

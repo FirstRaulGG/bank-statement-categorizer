@@ -2,18 +2,24 @@
 //
 // This decides what the model is allowed to see. A payment to an individual says nothing about
 // what it was for: the same person is rent one month and a birthday present the next. Sending it
-// to a model buys a guess and costs a third party's name. So such lines never go.
+// to a model buys a guess and costs a third party's name. So such lines are kept back.
+//
+// It is a best effort. With a CPF in sight the answer is exact. Without one it is a guess from the
+// shape of the text, and a guess can be wrong in both directions.
 
-import { digitsOf } from "./pii.js";
 import { isTransferRail } from "./clean.js";
 import type { Rail } from "./clean.js";
+import { digitsOf, mentionsCpf } from "./pii.js";
 import { normalizeName } from "./taxonomy.js";
 import type { Counterparty } from "./types.js";
 
 const COMPANY_MARKERS = new Set([
-  "LTDA", "ME", "SA", "EIRELI", "EPP", "MEI", "CIA", "COMERCIO", "SERVICOS", "INDUSTRIA", "ASSOCIACAO", "INSTITUTO",
+  "LTDA", "EIRELI", "EPP", "MEI", "CIA", "COMERCIO", "SERVICOS", "INDUSTRIA", "ASSOCIACAO", "INSTITUTO",
   "BANCO", "COOPERATIVA", "CONDOMINIO", "IGREJA", "PREFEITURA", "SECRETARIA", "MINISTERIO", "FUNDACAO", "SINDICATO",
 ]);
+// "ME" and "SA" mark a company only at the very end of a name. Elsewhere "SA" is a surname.
+const TRAILING_MARKERS = new Set(["ME", "SA"]);
+const PARTICLES = new Set(["DE", "DA", "DO", "DAS", "DOS", "E"]);
 
 /** Words that open a shop's name far more often than a person's. Extend it for your own data. */
 export const DEFAULT_TRADE_WORDS: readonly string[] = [
@@ -22,11 +28,14 @@ export const DEFAULT_TRADE_WORDS: readonly string[] = [
   "LIVRARIA", "PAPELARIA", "OFICINA", "AUTO", "PET", "HOTEL", "POUSADA", "SALAO", "BARBEARIA", "ACOUGUE",
   "HORTIFRUTI", "EMPORIO", "CAFE", "CAFETERIA", "STUDIO", "ESTACIONAMENTO", "TRANSPORTES", "SEGUROS", "ENERGIA",
   "TELECOM", "INTERNET", "AGUA", "GAS", "DISTRIBUIDORA", "ATACADO", "MAGAZINE", "OTICA", "FLORICULTURA",
+  "IMOBILIARIA", "AGENCIA", "ATELIE", "ESTUDIO", "CINE", "TEATRO", "COMPANHIA",
 ];
 
 export interface PersonCheck {
   /** Cleaned description. */
   text: string;
+  /** The bank's line, normalised. */
+  raw: string;
   rail: Rail | null;
   anchor: string;
   counterparty?: Counterparty;
@@ -35,28 +44,45 @@ export interface PersonCheck {
 /**
  * True when the other side is, or may well be, an individual.
  *
- * With a document the answer is exact: 11 digits is a person, 14 is a company. Without one it is
- * a guess that leans towards "person": on a person-to-person rail, two to five plain words with no
- * company marker and no trade word are taken to be a name. A two-word shop paid by Pix can be
- * caught by this. That is the intended direction of the error: the line goes to a generic bucket
- * or to review instead of to the model.
+ * Exact cases:
+ * - the bank's structured document has 11 digits (a person) or 14 (a company);
+ * - a CPF, whole or half-masked, is printed anywhere in the line or in the counterparty's name.
+ *
+ * Otherwise a guess, made only on a person-to-person rail (Pix, TED, DOC, transfer): two to eight
+ * words that are all name-like (letters, with an apostrophe, hyphen or abbreviation dot allowed),
+ * with no company marker and no trade word, are taken to be a name.
+ *
+ * Known misses, both ways:
+ * - a shop with a plain two-word name paid by Pix is taken for a person, and goes to a generic
+ *   bucket or to review instead of to the model;
+ * - a person paid by boleto or card, or printed as a single name, or on a line that does not say
+ *   how the money moved, is NOT recognised, and the line goes to the model with the name in it.
  */
 export function looksLikePerson(check: PersonCheck, tradeWords: ReadonlySet<string>): boolean {
   const document = digitsOf(check.counterparty?.document);
   if (document.length === 11) return true;
   if (document.length === 14 || check.anchor.startsWith("cnpj:")) return false;
+  if (mentionsCpf(check.raw) || mentionsCpf(check.counterparty?.name)) return true;
   if (!isTransferRail(check.rail)) return false;
 
   const words = check.text.split(" ").filter(Boolean);
-  if (words.length < 2 || words.length > 5) return false;
-  return words.every((word) => /^\p{L}{2,}$/u.test(word) && !COMPANY_MARKERS.has(word) && !tradeWords.has(word));
+  if (words.length < 2 || words.length > 8) return false;
+  return words.every((word, index) => {
+    if (!/^\p{L}[\p{L}'’.-]*$/u.test(word)) return false;
+    if (PARTICLES.has(word)) return true;
+    if (word.replace(/[^\p{L}]/gu, "").length < 2 && !/^\p{L}\.?$/u.test(word)) return false;
+    if (COMPANY_MARKERS.has(word) || tradeWords.has(word)) return false;
+    const last = index === words.length - 1;
+    const afterParticle = PARTICLES.has(words[index - 1] ?? "");
+    return !(TRAILING_MARKERS.has(word) && last && !afterParticle);
+  });
 }
 
 const NAME_NOISE = new Set(["DE", "DA", "DO", "DAS", "DOS", "E", "PIX", "TED", "DOC", "TRANSF", "TRANSFERENCIA", "ENVIADO", "ENVIADA", "RECEBIDO", "RECEBIDA"]);
 
 function nameTokens(value: string): string[] {
   return normalizeName(value)
-    .split(" ")
+    .split(/[\s-]+/)
     .map((token) => token.replace(/[^\p{L}]/gu, ""))
     .filter((token) => token && !NAME_NOISE.has(token));
 }

@@ -109,7 +109,7 @@ function confidenceOf(value: string | null | undefined): Confidence {
  *
  * Dropped, each on its own: entries that are not objects of the right shape, keys that were not in
  * the batch (the model cannot add groups), a second answer for the same key (the first stands),
- * an explicit `null` category (the model abstained), and categories that do not exist.
+ * an answer with neither an id nor a name (the model abstained), and categories that do not exist.
  *
  * Name and id are checked against each other. When they point at different categories the name
  * wins: models copy words more reliably than identifiers. When the id is valid but the name
@@ -136,12 +136,13 @@ export function parseDecisions(text: string, keys: ReadonlySet<string>, taxonomy
       continue;
     }
     seen.add(key);
-    if (categoryId === null || categoryId === undefined) {
+    // No id and no name is "I cannot tell". A name without an id is still an answer.
+    if (!categoryId && !categoryName) {
       dropped.push({ key, why: "the model abstained" });
       continue;
     }
 
-    const byId = taxonomy.get(categoryId);
+    const byId = categoryId ? taxonomy.get(categoryId) : undefined;
     const byName = categoryName ? taxonomy.findByName(categoryName) : undefined;
     const category = byName ?? byId;
     if (!category) {
@@ -153,7 +154,8 @@ export function parseDecisions(text: string, keys: ReadonlySet<string>, taxonomy
       key,
       categoryId: category.id,
       confidence: garbled ? "low" : confidenceOf(confidence),
-      reason: reason ?? "",
+      // Cut before anything else looks at it: a reason is a sentence, not a document.
+      reason: (reason ?? "").slice(0, 600),
     });
   }
   return { proposals, dropped };

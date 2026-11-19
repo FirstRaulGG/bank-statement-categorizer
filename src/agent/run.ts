@@ -5,7 +5,7 @@
 // through `decide` before it is written.
 //
 //   prepare -> holder transfers -> opposite twins -> card credits
-//           -> per group: history -> trusted dictionary -> individuals
+//           -> per group: history -> trusted dictionary -> individuals and unnamed lines kept back
 //           -> model (batched, time-boxed) -> parse -> decide -> apply or send to review
 
 import { redactName, scrub } from "../core/pii.js";
@@ -70,8 +70,10 @@ export interface CategorizeOptions {
   /** Words that mark a business rather than a person. Defaults to `DEFAULT_TRADE_WORDS`. */
   tradeWords?: readonly string[];
   anchorSecret?: string;
-  /** A sentence about the holder for the prompt. It is sent to the model: no names, no documents. */
+  /** A sentence about the holder for the prompt. It is scrubbed like a statement line and then sent. */
   context?: string;
+  /** Extra key that keeps transactions apart when grouping. The eval uses it to keep cases separate. */
+  partition?: (tx: Transaction) => string;
   now?: () => number;
 }
 
@@ -93,8 +95,14 @@ export interface RunReport {
   deadlineHit: boolean;
   /** Entries of the model's replies that were thrown away, and why. */
   dropped: Dropped[];
-  /** For each untrusted dictionary rule that produced a hint: how often the final answer agreed. */
+  /**
+   * For each untrusted dictionary rule that produced a hint: how often the final answer was the
+   * rule's category and how often it was another. The model saw the hint, so agreement is weak
+   * evidence; a rule the model keeps overruling is the useful signal.
+   */
   ruleShadow: Record<string, { agree: number; disagree: number }>;
+  /** Model calls that ran out of time. Their batches are pending. */
+  timeouts: number;
   /** Same-day, same-amount buckets with more than one candidate, left unpaired. */
   ambiguousTwins: number;
 }
@@ -119,7 +127,8 @@ export async function categorize(input: CategorizeInput, options: CategorizeOpti
   const now = options.now ?? Date.now;
   const deadline = now() + (options.maxMs ?? 45_000);
   const applyAt = options.applyAt ?? "medium";
-  const batchSize = Math.max(1, options.batchSize ?? 20);
+  if (!(applyAt in CONFIDENCE_RANK)) throw new Error(`applyAt must be one of ${Object.keys(CONFIDENCE_RANK).join(", ")}`);
+  const batchSize = Number.isInteger(options.batchSize) && options.batchSize! > 0 ? options.batchSize! : 20;
   const maxBatchChars = options.maxBatchChars ?? 6000;
   const callTimeoutMs = options.callTimeoutMs ?? 25_000;
   const holderName = normalizeName(input.holder.name);
@@ -127,6 +136,7 @@ export async function categorize(input: CategorizeInput, options: CategorizeOpti
   const items = prepare(input.transactions, input.accounts, {
     tradeWords: new Set((options.tradeWords ?? DEFAULT_TRADE_WORDS).map(normalizeName)),
     anchorSecret: options.anchorSecret,
+    partition: options.partition,
   });
   const dictionary = compileDictionary(options.dictionary ?? [], taxonomy);
   const today = input.today ?? items.reduce((latest, item) => (item.tx.date > latest ? item.tx.date : latest), "0000-00-00");
@@ -144,7 +154,9 @@ export async function categorize(input: CategorizeInput, options: CategorizeOpti
     dropped: [],
     ruleShadow: {},
     ambiguousTwins: 0,
+    timeouts: 0,
   };
+  const shadow = new Map<string, { agree: number; disagree: number }>();
 
   /** The only place a rule-based category is written. The sign rule is checked here, for every pass. */
   const settle = (item: Prepared, resolution: Resolution): boolean => {
@@ -171,15 +183,19 @@ export async function categorize(input: CategorizeInput, options: CategorizeOpti
   };
 
   // --- Passes over single transactions ---------------------------------------------------------
-  settleAll(holderTransfers(items, input.holder, taxonomy));
-  const twins = oppositeTwins(items, settled, input.holder, taxonomy);
+  // A line that moved no money has no direction, so no rule and no category can apply to it.
+  const live = items.filter((item) => item.tx.amountCents !== 0);
+  for (const item of items) if (item.tx.amountCents === 0) leave(item, "needs_review", "none", "The amount is zero.");
+
+  settleAll(holderTransfers(live, input.holder, taxonomy));
+  const twins = oppositeTwins(live, settled, input.holder, taxonomy);
   report.ambiguousTwins = twins.ambiguous;
   settleAll(twins.resolutions);
-  settleAll(cardCredits(items, settled, taxonomy));
+  settleAll(cardCredits(live, settled, taxonomy));
 
   // --- Passes over groups ----------------------------------------------------------------------
   const forModel: Group[] = [];
-  for (const group of buildGroups(items.filter((item) => !settled.has(item.tx.id)))) {
+  for (const group of buildGroups(live.filter((item) => !settled.has(item.tx.id)))) {
     const inherited = history.lookup(group.anchor, group.direction);
     if (inherited && group.items.every((item) => settle(item, inherited))) continue;
 
@@ -211,6 +227,12 @@ export async function categorize(input: CategorizeInput, options: CategorizeOpti
       continue;
     }
 
+    if (group.unnamed) {
+      // Only codes and bank labels: nothing for a model to read, and nothing to group by.
+      for (const item of group.items) leave(item, "needs_review", "none", "The line names no counterparty.");
+      continue;
+    }
+
     group.hint = match ?? null;
     forModel.push(group);
   }
@@ -235,7 +257,7 @@ export async function categorize(input: CategorizeInput, options: CategorizeOpti
     }
   } else {
     const promptOptions = { context: options.context, maskCompanyIds: options.maskCompanyIds };
-    const system = systemPrompt(taxonomy, promptOptions);
+    const system = systemPrompt(taxonomy, promptOptions, input.holder.name);
     const lines = new Map<string, PromptGroup>(queue.map((group) => [group.key, promptGroup(group, input.holder.name, promptOptions)]));
 
     const batches: Group[][] = [];
@@ -261,6 +283,7 @@ export async function categorize(input: CategorizeInput, options: CategorizeOpti
     };
 
     let stopReason: string | null = null;
+    let timeoutsInARow = 0;
     for (const batch of batches) {
       if (!stopReason && now() >= deadline) {
         report.deadlineHit = true;
@@ -280,13 +303,18 @@ export async function categorize(input: CategorizeInput, options: CategorizeOpti
       // Two attempts. An unreadable reply is usually a one-off; a second one is not. A reply that
       // can be read and says "I do not know" is an answer, and is not asked again.
       let readable = false;
+      let cutOff = false;
       let abstained = new Set<string | null>();
-      for (let attempt = 0; attempt < 2 && !readable && !stopReason; attempt += 1) {
+      /** Set when this batch, and only this batch, is given up on. */
+      let batchPending: string | null = null;
+      for (let attempt = 0; attempt < 2 && !readable && !stopReason && !batchPending; attempt += 1) {
         const remaining = deadline - now();
         if (remaining <= 0) break;
         const request = attempt === 0 ? messages : [...messages, { role: "user" as const, content: "Your previous reply could not be read. Reply with the JSON object only." }];
+        const signal = AbortSignal.timeout(Math.max(1, Math.min(callTimeoutMs, remaining)));
         try {
-          const result = await llm.complete(request, { signal: AbortSignal.timeout(Math.max(1, Math.min(callTimeoutMs, remaining))) });
+          const result = await llm.complete(request, { signal });
+          timeoutsInARow = 0;
           report.llmCalls += 1;
           batchUsage = addUsage(batchUsage, result.usage);
           model = result.model;
@@ -296,12 +324,27 @@ export async function categorize(input: CategorizeInput, options: CategorizeOpti
           proposals = new Map(parsed.proposals.map((proposal) => [proposal.key, proposal]));
           abstained = new Set(parsed.dropped.filter((entry) => entry.why === "the model abstained").map((entry) => entry.key));
           readable = parsed.proposals.length > 0 || parsed.dropped.some((entry) => entry.key !== null);
+          // A reply cut off at the output limit keeps the entries that arrived whole. Asking the
+          // same question again would be cut at the same place.
+          cutOff = Boolean(result.truncated);
         } catch (err) {
           if (err instanceof LlmOutputError) {
+            // Refused or empty, and billed all the same.
             report.llmCalls += 1;
+            if (err.usage) batchUsage = addUsage(batchUsage, err.usage);
+            if (err.model) model = err.model;
             continue;
           }
           if (err instanceof LlmUnavailableError || isAbort(err)) {
+            if (signal.aborted && now() < deadline) {
+              // This call was slow. One slow batch is not an outage; two in a row is treated as one.
+              report.timeouts += 1;
+              timeoutsInARow += 1;
+              if (timeoutsInARow < 2) {
+                batchPending = "The model took too long to answer this batch. Run again later.";
+                break;
+              }
+            }
             report.llmUnavailable = true;
             stopReason = "The model was unavailable. Run again later.";
             break;
@@ -310,34 +353,42 @@ export async function categorize(input: CategorizeInput, options: CategorizeOpti
         }
       }
 
-      if (!stopReason && !readable && now() >= deadline) {
+      if (!stopReason && !batchPending && !readable && now() >= deadline) {
         report.deadlineHit = true;
         stopReason = "The run's time budget ran out before this group was answered.";
       }
       report.usage = addUsage(report.usage, batchUsage);
       const batchCost = model ? estimateCost(batchUsage, model, options.prices) : 0;
       report.costUsd = report.costUsd === null || batchCost === null ? null : report.costUsd + batchCost;
-      if (stopReason) {
-        for (const group of batch) for (const item of group.items) leave(item, "pending", "none", stopReason);
+
+      // The batch's cost is shared by every group that was sent, answered or not: an unanswered
+      // group was paid for all the same, and so was a batch that ended up pending.
+      const perGroup = batchCost === null ? null : batchCost / batch.length;
+      const shareOf = (group: Group) => (perGroup === null ? null : perGroup / group.items.length);
+      const givenUp = stopReason ?? batchPending;
+      if (givenUp) {
+        for (const group of batch) for (const item of group.items) leave(item, "pending", "none", givenUp, { costUsd: shareOf(group) });
         continue;
       }
 
-      // The batch's cost is shared by every group that was sent, answered or not: an unanswered
-      // group was paid for all the same.
-      const perGroup = batchCost === null ? null : batchCost / batch.length;
       for (const group of batch) {
-        const costUsd = perGroup === null ? null : perGroup / group.items.length;
+        const costUsd = shareOf(group);
         const proposal = proposals.get(group.key);
         if (!proposal) {
-          const why = abstained.has(group.key) ? "The model could not tell from the text." : "The model gave no usable answer for this group.";
+          const why = abstained.has(group.key)
+            ? "The model could not tell from the text."
+            : cutOff
+              ? "The model's reply was cut off before it reached this group."
+              : "The model gave no usable answer for this group.";
           for (const item of group.items) leave(item, "needs_review", "model", why, { costUsd });
           continue;
         }
         const verdict = decide(group, proposal.categoryId, taxonomy);
-        if (group.hint) {
-          const shadow = (report.ruleShadow[group.hint.rule.id] ??= { agree: 0, disagree: 0 });
-          if (verdict.categoryId === group.hint.rule.categoryId) shadow.agree += 1;
-          else shadow.disagree += 1;
+        if (group.hint && verdict.categoryId !== null) {
+          const counts = shadow.get(group.hint.rule.id) ?? { agree: 0, disagree: 0 };
+          if (verdict.categoryId === group.hint.rule.categoryId) counts.agree += 1;
+          else counts.disagree += 1;
+          shadow.set(group.hint.rule.id, counts);
         }
         const reason = cleanReason(proposal.reason) || "No reason given.";
         for (const item of group.items) {
@@ -370,6 +421,7 @@ export async function categorize(input: CategorizeInput, options: CategorizeOpti
   for (const decision of ordered) byStage[decision.stage] += 1;
   return {
     ...report,
+    ruleShadow: Object.fromEntries(shadow),
     decisions: ordered,
     anchors: Object.fromEntries(items.map((item) => [item.tx.id, item.anchor])),
     byStage,
@@ -379,16 +431,19 @@ export async function categorize(input: CategorizeInput, options: CategorizeOpti
 /**
  * What to store from a run so that it can serve as history later. Only answers of the model are
  * returned: an inherited or rule-based answer is not new evidence, and storing it as such is how
- * a system ends up agreeing with itself.
+ * a system ends up agreeing with itself. One row per counterparty and direction, however many
+ * transactions the answer covered: it was one answer.
  */
 export function toHistory(report: RunReport, transactions: readonly Transaction[], decidedAt: string): PastDecision[] {
   const byId = new Map(transactions.map((tx) => [tx.id, tx]));
-  const rows: PastDecision[] = [];
+  const rows = new Map<string, PastDecision>();
   for (const decision of report.decisions) {
     const tx = byId.get(decision.transactionId);
     const anchor = report.anchors[decision.transactionId];
     if (!tx || !anchor || decision.stage !== "model" || decision.status !== "applied" || !decision.categoryId || !decision.confidence) continue;
-    rows.push({ anchor, direction: tx.amountCents < 0 ? "out" : "in", categoryId: decision.categoryId, source: "model", confidence: decision.confidence, decidedAt });
+    const direction = tx.amountCents < 0 ? "out" : "in";
+    const key = `${anchor}#${direction}#${decision.categoryId}`;
+    if (!rows.has(key)) rows.set(key, { anchor, direction, categoryId: decision.categoryId, source: "model", confidence: decision.confidence, decidedAt });
   }
-  return rows;
+  return [...rows.values()];
 }

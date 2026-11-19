@@ -29,10 +29,13 @@ export function formatEval(report: EvalReport, taxonomy: Taxonomy): string {
     `Decided by the model itself: ${rate(report.modelOnly)}`,
     report.consistency === null ? "" : `Consistency across samples: ${percent(report.consistency)}`,
     `Tokens: ${report.usage.inputTokens} in (${report.usage.cachedInputTokens} cached), ${report.usage.outputTokens} out    Cost: ${cost(report.costUsd)}`,
-    report.costUsd !== null && report.total ? `Cost per 1,000 cases at this rate: $${((report.costUsd / report.total / report.samples) * 1000).toFixed(2)}` : "",
+    report.costUsd !== null && report.total
+      ? `Cost per 1,000 golden cases at this rate: $${((report.costUsd / report.total / report.samples) * 1000).toFixed(2)} (a case is one counterparty, and cases settled by rules cost nothing)`
+      : "",
+    report.total < 200 ? `Note: with ${report.total} cases, a difference of a few points between two runs is noise.` : "",
     report.llmUnavailable ? "WARNING: the model was unavailable for part of this run. The figures above are not comparable." : "",
     report.judge
-      ? `Judge: mean reason score ${report.judge.mean === null ? "n/a" : report.judge.mean.toFixed(2)} over ${report.judge.scored} answers (${report.judge.unreadable} unreadable)`
+      ? `Judge (${report.judge.model || "no answer"}): mean reason score ${report.judge.mean === null ? "n/a" : report.judge.mean.toFixed(2)} over ${report.judge.scored} answers (${report.judge.unreadable} unreadable), cost ${cost(report.judge.costUsd)}${report.judge.failed ? " - STOPPED EARLY: the judge became unavailable" : ""}`
       : "",
     "",
     ...table("By stage (which part of the pipeline answered):", report.byStage),
@@ -54,12 +57,12 @@ export function formatEval(report: EvalReport, taxonomy: Taxonomy): string {
 }
 
 export function formatComparison(a: EvalReport, b: EvalReport, comparison: Comparison): string {
-  const sign = (value: number) => (value > 0 ? "+" : "");
+  const sign = (value: number) => (value > 0 ? "+" : value < 0 ? "-" : "");
   return [
     `A: ${a.model}  ${percent(a.accuracy)}  ${cost(a.costUsd)}`,
     `B: ${b.model}  ${percent(b.accuracy)}  ${cost(b.costUsd)}`,
-    `B - A: ${sign(comparison.accuracyDelta)}${(comparison.accuracyDelta * 100).toFixed(1)} points${
-      comparison.costDelta === null ? "" : `, ${sign(comparison.costDelta)}$${comparison.costDelta.toFixed(4)}`
+    `B - A: ${sign(comparison.accuracyDelta)}${Math.abs(comparison.accuracyDelta * 100).toFixed(1)} points${
+      comparison.costDelta === null ? "" : `, ${sign(comparison.costDelta)}$${Math.abs(comparison.costDelta).toFixed(4)}`
     }`,
     `Fixed by B (${comparison.fixed.length}): ${comparison.fixed.join(", ") || "-"}`,
     `Broken by B (${comparison.broken.length}): ${comparison.broken.join(", ") || "-"}`,

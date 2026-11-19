@@ -45,7 +45,10 @@ export function holderTransfers(items: readonly Prepared[], holder: Holder, taxo
   return found;
 }
 
-const BILL_ON_CHECKING = /\b(?:FATURA|CARTAO)\b/;
+// "FATURA", or a payment word together with "CARTAO". The word "CARTAO" alone is not enough: it
+// is on every debit-card purchase.
+const BILL_ON_CHECKING = /\bFATURA\b|\b(?:PAGAMENTO|PAGTO|PGTO|PAG)\b.*\bCARTAO\b/;
+const PURCHASE = /\bCOMPRAS?\b/;
 const PAYMENT_ON_CARD = /\b(?:PAGAMENTO|PAGTO|PGTO)\b/;
 
 function namesHolder(item: Prepared, holder: Holder): boolean {
@@ -65,8 +68,9 @@ export interface TwinResult {
  *   other side: one leg already settled as an own transfer, or a leg that names the holder while
  *   no leg names somebody else. Paying a friend and being paid the same sum by another friend on
  *   the same day is not a transfer.
- * - Money out of checking and into a card account is the card bill, when either line says so.
- *   A purchase on the card and a deposit in checking have the wrong directions and never match.
+ * - Money out of checking and into a card account is the card bill, when either line says so
+ *   ("FATURA", or a payment word). A debit-card purchase and a reversal on the card that happen
+ *   to match are not one; nor are a purchase on the card and a deposit in checking.
  *
  * Pairs are only formed when a day has exactly one candidate on each side. With two outflows of
  * the same amount there is no way to know which one the inflow belongs to, and a wrong pair hides
@@ -104,8 +108,10 @@ export function oppositeTwins(items: readonly Prepared[], settled: ReadonlyMap<s
     if (out.account.kind === "checking" && into.account.kind === "checking") {
       const anchored = [out, into].some((leg) => settled.get(leg.tx.id)?.categoryId === taxonomy.special.ownTransfer);
       const named = [out, into].some((leg) => namesHolder(leg, holder));
+      // A leg that names somebody else rules the pair out, even when the other leg is known to
+      // be the holder's: the holder sent money out, and a friend happened to send the same sum in.
       const contradicted = [out, into].some((leg) => leg.person && !namesHolder(leg, holder) && !settled.has(leg.tx.id));
-      if (!anchored && (!named || contradicted)) continue;
+      if (contradicted || (!anchored && !named)) continue;
       const resolution: Resolution = {
         categoryId: taxonomy.special.ownTransfer,
         confidence: "high",
@@ -118,6 +124,8 @@ export function oppositeTwins(items: readonly Prepared[], settled: ReadonlyMap<s
     }
 
     if (out.account.kind === "checking" && into.account.kind === "card") {
+      // A purchase is not a bill payment, and a reversal on the card is not a payment received.
+      if (PURCHASE.test(out.raw) || into.reversal) continue;
       if (!BILL_ON_CHECKING.test(out.raw) && !PAYMENT_ON_CARD.test(into.raw)) continue;
       const resolution: Resolution = {
         categoryId: taxonomy.special.cardBill,

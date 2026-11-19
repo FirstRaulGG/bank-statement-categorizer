@@ -39,9 +39,26 @@ describe("ClaudeClient", () => {
     expect(result).toEqual({ text: '{"decisions":[]}', model: "claude-test-1", usage: { inputTokens: 100, outputTokens: 5, cachedInputTokens: 90 } });
   });
 
-  it("reports a refusal or a truncated reply as unusable output", async () => {
-    await expect(claude(async () => reply({ stop_reason: "refusal" })).complete(MESSAGES)).rejects.toBeInstanceOf(LlmOutputError);
-    await expect(claude(async () => reply({ stop_reason: "max_tokens" })).complete(MESSAGES)).rejects.toBeInstanceOf(LlmOutputError);
+  it("reports a refusal as unusable output, with what it cost", async () => {
+    const refusal = claude(async () => reply({ stop_reason: "refusal" })).complete(MESSAGES);
+    await expect(refusal).rejects.toBeInstanceOf(LlmOutputError);
+    await expect(refusal).rejects.toMatchObject({ usage: { inputTokens: 100, outputTokens: 5 }, model: "claude-test-1" });
+  });
+
+  it("returns a reply that was cut off, marked as such, instead of throwing it away", async () => {
+    await expect(claude(async () => reply({ stop_reason: "max_tokens" })).complete(MESSAGES)).resolves.toMatchObject({ truncated: true, text: '{"decisions":[]}' });
+    await expect(claude(async () => reply()).complete(MESSAGES)).resolves.not.toHaveProperty("truncated");
+  });
+
+  it("sends neither effort nor a fallback unless asked, and refuses to start without a model", async () => {
+    let body: Record<string, unknown> = {};
+    await claude(async (sent) => {
+      body = sent;
+      return reply();
+    }).complete(MESSAGES);
+    expect(body).not.toHaveProperty("output_config");
+    expect(body).not.toHaveProperty("fallbacks");
+    expect(() => new ClaudeClient({ model: "" })).toThrow(/model/);
   });
 
   it("maps rate limits, server errors and lost connections to 'unavailable', and lets a 400 through", async () => {
@@ -86,9 +103,13 @@ describe("OpenAiCompatibleClient", () => {
     await expect(badRequest).rejects.not.toBeInstanceOf(LlmUnavailableError);
   });
 
-  it("reports an empty or cut-off reply as unusable output", async () => {
+  it("reports an empty reply as unusable output and returns a cut-off one", async () => {
     await expect(client(async () => json(200, { choices: [{ message: { content: "" } }] })).complete(MESSAGES)).rejects.toBeInstanceOf(LlmOutputError);
-    await expect(client(async () => json(200, { choices: [{ message: { content: "{" }, finish_reason: "length" }] })).complete(MESSAGES)).rejects.toBeInstanceOf(LlmOutputError);
+    await expect(client(async () => json(200, { choices: [{ message: { content: "{" }, finish_reason: "length" }] })).complete(MESSAGES)).resolves.toMatchObject({ truncated: true, text: "{" });
+  });
+
+  it("does not quote the provider's error body, which may echo statement lines", async () => {
+    await expect(client(async () => json(422, { error: "invalid input: PIX ENVIADO JOAQUIM" })).complete(MESSAGES)).rejects.toThrow(/^LLM provider returned 422$/);
   });
 });
 

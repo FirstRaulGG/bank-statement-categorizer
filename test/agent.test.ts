@@ -395,6 +395,11 @@ describe("categorize: cost and history", () => {
     };
     expect(await again(rows, "2026-03-11")).toBe("model");
     expect(await again(rows, "2026-04-20")).toBe("model");
-    expect(await again([...rows, ...rows], "2026-04-20")).toBe("history");
+    // The same answer stored twice is still one answer.
+    expect(await again([...rows, ...rows], "2026-04-20")).toBe("model");
+    // A second run, on another day, that reached the same answer on its own.
+    const second = toHistory(await run([tx("LOJA AURORA", -300)], { llm: new ScriptedLlm(answer("shopping")) }), first, "2026-03-12");
+    expect(second).toHaveLength(0);
+    expect(await again([...rows, { ...rows[0]!, decidedAt: "2026-03-12" }], "2026-04-20")).toBe("history");
   });
 });

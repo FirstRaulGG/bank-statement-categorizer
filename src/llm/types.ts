@@ -21,6 +21,8 @@ export interface LlmResult {
   usage: LlmUsage;
   /** The model that actually answered. */
   model: string;
+  /** The reply was cut off at the output limit. What arrived is in `text`. */
+  truncated?: boolean;
 }
 
 export interface LlmCallOptions {
@@ -53,11 +55,18 @@ export function isUnavailableStatus(status: number): boolean {
   return status === 401 || status === 402 || status === 403 || status === 408 || status === 429 || status >= 500;
 }
 
-/** Thrown when the provider answered but there is nothing usable to parse (refusal, truncation). */
+/**
+ * Thrown when the provider answered but there is nothing to parse (a refusal, an empty reply).
+ * The call was still billed, so it carries the usage when the provider reported it.
+ */
 export class LlmOutputError extends Error {
-  constructor(message: string) {
+  readonly usage: LlmUsage | undefined;
+  readonly model: string | undefined;
+  constructor(message: string, usage?: LlmUsage, model?: string) {
     super(message);
     this.name = "LlmOutputError";
+    this.usage = usage;
+    this.model = model;
   }
 }
 

@@ -140,7 +140,7 @@ const OTHER = "987.654.321-11";
 
 describe("looksLikePerson", () => {
   const check = (text: string, rail: "pix" | "card" | null, document?: string) =>
-    looksLikePerson({ text, rail, anchor: "A", ...(document ? { counterparty: { document } } : {}) }, TRADE);
+    looksLikePerson({ text, raw: text, rail, anchor: "A", ...(document ? { counterparty: { document } } : {}) }, TRADE);
 
   it("is exact with a document", () => {
     expect(check("PADARIA TRIGO DOURADO", "pix", OTHER)).toBe(true);

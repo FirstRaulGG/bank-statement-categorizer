@@ -45,6 +45,11 @@ function escapeRegExp(value: string): string {
  * Validates and compiles the rules. A rule naming a category that does not exist, or carrying a
  * regular expression that does not compile, is a configuration error and throws here, at start-up.
  *
+ * Rules are configuration and are trusted as such. A regular expression is run as written: one
+ * that backtracks catastrophically will hang the run, so do not load patterns from people you
+ * would not let write code. A `trusted` rule is applied wherever its text appears in a line, with
+ * nobody checking; mark as trusted only words that mean one thing.
+ *
  * How a match is chosen:
  * - a pattern of four characters or fewer must stand as a word ("BAR" does not match "BARBEARIA");
  *   longer patterns match anywhere, so names the bank glued together are still found;
@@ -59,7 +64,9 @@ export function compileDictionary(rules: readonly DictionaryRule[], taxonomy: Ta
     ids.add(rule.id);
     if (!taxonomy.get(rule.categoryId)) throw new Error(`dictionary rule "${rule.id}" names a category that does not exist: "${rule.categoryId}"`);
     if (rule.match === "regex") {
-      return { rule, order, find: new RegExp(rule.pattern, "u"), length: rule.pattern.length, confidence: "medium" };
+      if (!rule.pattern) throw new Error(`dictionary rule "${rule.id}" has an empty pattern`);
+      // The text it runs against is upper case without accents, so case is ignored.
+      return { rule, order, find: new RegExp(rule.pattern, "iu"), length: rule.pattern.length, confidence: "medium" };
     }
     const pattern = normalizeName(rule.pattern);
     if (pattern.length < 2) throw new Error(`dictionary rule "${rule.id}" has a pattern shorter than two characters`);

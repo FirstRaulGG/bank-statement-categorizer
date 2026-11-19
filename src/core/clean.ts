@@ -6,7 +6,7 @@
 
 import { createHash, createHmac } from "node:crypto";
 
-import { digitsOf, isValidCnpj } from "./pii.js";
+import { digitsOf, isValidCnpj, plainForm, scrub } from "./pii.js";
 import { normalizeName } from "./taxonomy.js";
 import type { Counterparty } from "./types.js";
 
@@ -33,14 +33,17 @@ export function isTransferRail(rail: Rail | null): boolean {
 const PREFIXES: readonly RegExp[] = [
   /^(?:PIX|TED|DOC|TEF)\s+(?:ENVIAD[OA]|RECEBID[OA]|TRANSF(?:ERENCIA)?|QR\s?CODE|QRS?|EMITID[OA]|CRED(?:ITO)?|DEB(?:ITO)?)\b[\s:–-]*/,
   /^TRANSF(?:ERENCIA)?\s+(?:ENVIADA|RECEBIDA|PIX|ENTRE\s+CONTAS)\b[\s:–-]*/,
+  /^(?:PIX|TED|DOC)\/(?:PIX|TED|DOC)\b[\s:/-]*/,
+  /^(?:ENVIAD[OA]|RECEBID[OA])\b[\s:/-]*/,
   /^TRANSF(?:ERENCIA)?\b[\s:–-]*/,
   /^COMPRAS?\s+(?:(?:NO|COM)\s+)?(?:CARTAO|DEBITO|CREDITO)(?:\s+(?:DE\s+)?(?:DEBITO|CREDITO))?\b[\s:–-]*/,
   /^COMPRAS?\b[\s:–-]+/,
   /^(?:PAGTO|PAGAMENTO|PGTO|PAG)\s+(?:DE\s+)?(?:BOLETO|TITULO|CONTA|COBRANCA)\b[\s:–-]*/,
   /^DEB(?:ITO)?\s+AUT(?:OMATICO)?\b[\s:–-]*/,
   /^(?:PIX|TED|DOC)\b[\s:–-]*/,
-  // A payment processor's tag: a few characters and an asterisk in front of the real merchant.
-  /^[A-Z0-9]{2,8}\s?\*\s?/,
+  // A payment processor's tag: two or three characters and an asterisk in front of the real
+  // merchant. Anything longer before the asterisk is as likely to be the merchant's own name.
+  /^[A-Z0-9]{2,3}\s?\*\s?/,
   /^[\s:*–-]+/,
 ];
 
@@ -50,8 +53,8 @@ const SUFFIXES: readonly RegExp[] = [
   /\s+\d{2}\/\d{2}(?:\/\d{2,4})?$/,
   /\s+\d{2}:\d{2}(?::\d{2})?$/,
   // A place is only cut when a country marker confirms it is one; a shop can be named after a city.
-  /\s+[A-Z]+\s+(?:BRA?|BRASIL)$/,
-  /\s+(?:BRA?|BRASIL)$/,
+  /\s+[A-Z]{3,}\s+BRA?$/,
+  /\s+BRA?$/,
   /\s+\d{6,}$/,
   /[\s:*–-]+$/,
 ];
@@ -75,11 +78,27 @@ function strip(text: string, rules: readonly RegExp[]): string {
 
 /** Upper case, no accents, no bank labels, no trailing codes. */
 export function cleanDescription(raw: string): string {
-  const normalized = normalizeName(raw.replace(/\|/g, " "));
-  return strip(strip(normalized, PREFIXES), SUFFIXES).replace(/\s+/g, " ").trim();
+  const normalized = normalizeName(plainForm(raw).replace(/\|/g, " "));
+  return strip(strip(normalized, PREFIXES), SUFFIXES).replace(/\*/g, " ").replace(/\s+/g, " ").trim();
 }
 
 const STOPWORDS = new Set(["DE", "DA", "DO", "DAS", "DOS", "E", "EM", "NO", "NA", "LTDA", "ME", "SA", "EIRELI", "EPP", "MEI", "CIA"]);
+
+// Words that say how the money moved, not who it went to. A line made only of these names nobody.
+const LABELS = new Set([
+  "PIX", "TED", "DOC", "TEF", "TRANSF", "TRANSFERENCIA", "ENVIADO", "ENVIADA", "RECEBIDO", "RECEBIDA", "BOLETO", "TITULO",
+  "PAGTO", "PAGAMENTO", "PGTO", "PAG", "COMPRA", "COMPRAS", "CARTAO", "DEBITO", "CREDITO", "DEB", "CRED", "AUT", "AUTOMATICO",
+  "SAQUE", "DEPOSITO", "QR", "CODE", "CPF", "CNPJ",
+]);
+
+/** Prefix of the anchor given to a line that names no counterparty. Such lines are never grouped. */
+export const UNNAMED = "unnamed:";
+
+/** Hash that stands in for something that must not be stored as it is. Keyed when a secret is given. */
+export function opaque(value: string, secret?: string): string {
+  const hash = secret ? createHmac("sha256", secret).update(value).digest("hex") : createHash("sha256").update(value).digest("hex");
+  return hash.slice(0, 16);
+}
 
 // Written with its punctuation, a company id is unmistakable. As a bare run of 14 digits it is only
 // taken for one when the check digits agree: boleto and authentication codes are that long too.
@@ -106,29 +125,28 @@ export interface AnchorOptions {
  * - A company id (CNPJ), when the line or the bank's structured field has one: `cnpj:<14 digits>`.
  * - An individual's CPF from the structured field, hashed: `person:<hash>`. The number itself is
  *   never part of an anchor.
- * - Otherwise the first two meaningful words of the cleaned text.
+ * - Otherwise the first two meaningful words of the cleaned text, or `unnamed:` when there are
+ *   none. `prepare` completes that one with the transaction id, and replaces the anchor of anyone
+ *   who looks like an individual with a hash of their name.
  */
 export function anchorOf(cleaned: string, raw: string, counterparty: Counterparty | undefined, options: AnchorOptions = {}): string {
   const document = digitsOf(counterparty?.document);
   if (document.length === 14) return `cnpj:${document}`;
-  if (document.length === 11) {
-    const hash = options.anchorSecret
-      ? createHmac("sha256", options.anchorSecret).update(document).digest("hex")
-      : createHash("sha256").update(document).digest("hex");
-    return `person:${hash.slice(0, 16)}`;
-  }
+  if (document.length === 11) return `person:${opaque(document, options.anchorSecret)}`;
   const inText = companyIdIn(raw);
   if (inText) return `cnpj:${inText}`;
 
+  // An anchor is stored, so it is built from the scrubbed text: no CPF, phone, e-mail or code can
+  // become part of one.
   const words: string[] = [];
-  for (const token of cleaned.split(" ")) {
+  for (const token of scrub(cleaned, { maskCompanyIds: true }).split(" ")) {
+    if (token.includes("[") || token.includes("]")) continue;
     const word = token.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "");
-    // Codes, phone numbers and e-mail keys are not names, and an anchor is stored.
-    if (!word || STOPWORDS.has(word) || /\d{4,}/.test(word) || /^\d+$/.test(word) || /[@[\]]/.test(word)) continue;
+    if (!word || STOPWORDS.has(word) || LABELS.has(word) || /^\d+$/.test(word) || /\d{4,}/.test(word)) continue;
     words.push(word);
     if (words.length === 2) break;
   }
-  return words.join(" ") || "UNKNOWN";
+  return words.join(" ") || UNNAMED;
 }
 
 /** The best text to read a counterparty from: the bank's structured name when the line itself has none. */
@@ -138,4 +156,11 @@ export function describeLine(raw: string, counterparty: Counterparty | undefined
   // A line that is only an operation label ("PIX ENVIADO") cleans down to that label or to digits.
   const empty = !/\p{L}{3,}/u.test(cleaned) || /^(?:(?:PIX|TED|DOC|TEF|TRANSF(?:ERENCIA)?|PAGAMENTO|PAGTO|COMPRA|ENVIAD[OA]|RECEBID[OA])\s*)+$/.test(cleaned);
   return empty && name ? name : cleaned;
+}
+
+const REVERSAL = /(?<!\p{L})(?:ESTORNO|ESTORNADO|REEMBOLSO|DEVOLUCAO|DEVOLVIDO|CHARGEBACK|CANCELAMENTO)(?!\p{L})/u;
+
+/** Whether a normalised line says it is money coming back: a refund, a reversal, a chargeback. */
+export function isReversalLine(normalizedRaw: string): boolean {
+  return REVERSAL.test(normalizedRaw);
 }

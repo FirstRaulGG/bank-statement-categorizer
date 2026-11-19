@@ -51,24 +51,26 @@ export class OpenAiCompatibleClient implements LlmClient {
       if (isUnavailableStatus(response.status)) {
         throw new LlmUnavailableError(`the model provider is unavailable (${response.status})`, response.status);
       }
-      const detail = await response.text().catch(() => "");
-      throw new Error(`LLM provider returned ${response.status}: ${detail.slice(0, 300)}`);
+      // The body is not quoted: providers echo the request in error messages, and the request
+      // holds statement lines.
+      throw new Error(`LLM provider returned ${response.status}`);
     }
 
     const json = (await response.json()) as ChatCompletionResponse;
     const choice = json.choices?.[0];
     const text = typeof choice?.message?.content === "string" ? choice.message.content : "";
-    if (!text) throw new LlmOutputError("the provider returned an empty reply");
-    if (choice?.finish_reason === "length") throw new LlmOutputError("the model's reply was cut off");
+    const usage = {
+      inputTokens: json.usage?.prompt_tokens ?? 0,
+      outputTokens: json.usage?.completion_tokens ?? 0,
+      cachedInputTokens: json.usage?.prompt_tokens_details?.cached_tokens ?? 0,
+    };
+    if (!text) throw new LlmOutputError("the provider returned an empty reply", usage, json.model ?? model);
 
     return {
       text,
       model: json.model ?? model,
-      usage: {
-        inputTokens: json.usage?.prompt_tokens ?? 0,
-        outputTokens: json.usage?.completion_tokens ?? 0,
-        cachedInputTokens: json.usage?.prompt_tokens_details?.cached_tokens ?? 0,
-      },
+      usage,
+      ...(choice?.finish_reason === "length" ? { truncated: true } : {}),
     };
   }
 }

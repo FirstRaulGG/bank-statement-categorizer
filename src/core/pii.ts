@@ -46,20 +46,48 @@ export function formatCnpj(digits: string): string {
   return digits.replace(/^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})$/, "$1.$2.$3/$4-$5");
 }
 
+// A digit or one of the characters banks print in place of a hidden digit.
+const M = String.raw`[\d*•xX]`;
+const EDGE = String.raw`[\p{L}\p{N}*•]`;
+
 // One alternation, tried left to right at each position, so the more specific shape wins.
 const IDENTIFIERS = new RegExp(
   [
-    String.raw`(?<email>[\p{L}\p{N}._%+-]+@[\p{L}\p{N}-]+(?:\.[\p{L}\p{N}-]+)+)`,
+    String.raw`(?<email>(?<![\p{L}\p{N}._%+-])[\p{L}\p{N}._%+-]{1,64}@[\p{L}\p{N}-]{1,63}(?:\.[\p{L}\p{N}-]{1,63})+)`,
     // A random Pix key is a UUID.
     String.raw`(?<key>\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b)`,
-    String.raw`(?<cnpj>(?<!\d)\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}(?!\d))`,
-    // Also the half-masked form banks print, such as ***.456.789-**.
-    String.raw`(?<cpf>(?<![\d*])[\d*]{3}\.[\d*]{3}\.[\d*]{3}-[\d*]{2}(?![\d*]))`,
-    String.raw`(?<phone>(?<!\d)(?:\+?55[\s-]?)?\(?\d{2}\)?[\s-]?9?\d{4}[\s-]\d{4}(?!\d))`,
-    String.raw`(?<run>(?<!\d)\d{7,}(?!\d))`,
+    String.raw`(?<cnpj>(?<!\d)\d{2}\.?\d{3}\.?\d{3}/\d{4}-?\d{2}(?!\d))`,
+    // Three, three, three and two, however they are separated, and however much is masked:
+    // 123.456.789-00, 12345678900, 123 456 789 00, ***.456.789-**, •••.456.789-••.
+    String.raw`(?<cpf>(?<!${EDGE})${M}{3}[\s.]?${M}{3}[\s.]?${M}{3}\s?[-.\s]?\s?${M}{2}(?!${EDGE}))`,
+    String.raw`(?<phone>(?<!\d)(?:\+?55[\s.-]?)?\(?\d{2}\)?[\s.-]?9?[\s.-]?\d{4}[\s.-]\d{4}(?!\d))`,
+    // Two long runs side by side are one identifier printed with a gap.
+    String.raw`(?<split>(?<!\d)\d{4,}\s\d{4,}(?!\d))`,
+    String.raw`(?<run>(?<!\d)\d(?:[.\-/]?\d){6,}(?!\d))`,
   ].join("|"),
   "giu",
 );
+
+const MINUS = String.fromCodePoint(0x2212);
+const DASHES = new RegExp(String.raw`[\p{Pd}${MINUS}]`, "gu");
+
+function asciiDigit(char: string): string {
+  const code = char.codePointAt(0)!;
+  if (code < 128) return char;
+  // Decimal digits of every script sit in runs of ten, zero first.
+  let value = 0;
+  while (value < 9 && /\p{Nd}/u.test(String.fromCodePoint(code - value - 1))) value += 1;
+  return String(value);
+}
+
+/**
+ * One spelling for what can be spelled many ways: fullwidth and other compatibility forms folded,
+ * every kind of dash turned into a hyphen, digits of any script turned into 0-9. Without this a
+ * CPF written with a non-breaking hyphen walks past every pattern.
+ */
+export function plainForm(text: string): string {
+  return text.normalize("NFKC").replace(DASHES, "-").replace(/\p{Nd}/gu, asciiDigit);
+}
 
 export interface ScrubOptions {
   /**
@@ -74,38 +102,73 @@ export interface ScrubOptions {
  * `[cnpj]` when asked.
  *
  * It matches on shape, not on validity. An 11-digit run is treated as a CPF whether or not its
- * check digits are right: a wrong guess costs a placeholder, a missed one leaks a person.
+ * check digits are right: a wrong guess costs a placeholder, a missed one leaks a person. It is
+ * blunt in the same direction elsewhere: a date or a long amount in the middle of a line becomes
+ * `[number]` too.
+ *
+ * It is a net, not a proof. A format nobody thought of gets through. The text is returned in its
+ * plain form (see `plainForm`).
  */
 export function scrub(text: string, options: ScrubOptions = {}): string {
-  return text.replace(IDENTIFIERS, (match, ...rest) => {
+  return plainForm(text).replace(IDENTIFIERS, (match, ...rest) => {
     const groups = rest[rest.length - 1] as Record<string, string | undefined>;
     if (groups.email) return "[email]";
     if (groups.key) return "[key]";
     if (groups.cnpj) return options.maskCompanyIds ? "[cnpj]" : match;
     if (groups.cpf) return "[cpf]";
     if (groups.phone) return "[phone]";
-    if (match.length === 11) return "[cpf]";
+    if (groups.split) return "[number]";
+    const digits = digitsOf(match);
+    if (digits.length === 11) return "[cpf]";
     // A bare 14-digit run is kept only if it really is a company id; otherwise it is some code.
-    if (match.length === 14 && isValidCnpj(match)) return options.maskCompanyIds ? "[cnpj]" : match;
+    if (digits.length === 14 && isValidCnpj(digits)) return options.maskCompanyIds ? "[cnpj]" : match;
     return "[number]";
   });
 }
+
+/** Whether the text carries anything shaped like a CPF, whole or half-masked. */
+export function mentionsCpf(text: string | undefined): boolean {
+  if (!text) return false;
+  const plain = plainForm(text);
+  const labelled = /(?<!\p{L})CPF(?!\p{L})/iu.test(plain);
+  for (const match of plain.matchAll(CPF_SHAPE)) {
+    // Eleven bare digits could as well be a phone number or a code. Punctuation, a mask or the
+    // word "CPF" beside them is what makes them a CPF.
+    if (labelled || /\D/.test(match[0])) return true;
+  }
+  return false;
+}
+
+const CPF_SHAPE = new RegExp(String.raw`(?<!${EDGE})${M}{3}[\s.]?${M}{3}[\s.]?${M}{3}\s?[-.\s]?\s?${M}{2}(?!${EDGE})`, "gu");
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+const PARTICLES = new Set(["DE", "DA", "DO", "DAS", "DOS", "E"]);
+
 /**
- * Replaces a person's name inside already-normalised text (upper case, no accents). Any run of two
- * or more consecutive words that all belong to the name is replaced, so "MARINA PRADO" and
- * "MARINA A PRADO" both go, while a lone "PRADO" in a shop's name stays.
+ * Replaces a person's name in a text. `normalizedName` is upper case without accents; the text may
+ * be in any case, and comes back without accents.
+ *
+ * What is replaced is a run of two or more parts of the name, where a part is one of its words, a
+ * word cut short by the bank ("ALBUQUERQ"), or an initial, and where "DE", "DA" and the like may
+ * sit between parts. So "MARINA PRADO", "MARINA A. PRADO", "M A PRADO" and "MARINA DE PRADO" all
+ * go.
+ *
+ * A single word of the name on its own is left alone, because it is as likely to be part of a
+ * shop's name ("EMPORIO PRADO"). For the same reason a holder known by one word is not redacted
+ * at all.
  */
 export function redactName(text: string, normalizedName: string, placeholder: string): string {
-  const words = [...new Set(normalizedName.split(" ").filter((token) => token.length >= 2))];
+  const words = [...new Set(normalizedName.split(/[\s-]+/).filter((token) => token.length >= 2 && !PARTICLES.has(token)))];
   if (words.length < 2) return text;
-  // A middle name is often printed as its initial.
-  const initials = [...new Set(words.map((word) => word[0] ?? ""))].filter(Boolean);
-  const word = `(?:${words.map(escapeRegExp).join("|")})`;
-  const wordOrInitial = `(?:${[...words, ...initials].map(escapeRegExp).join("|")})`;
-  return text.replace(new RegExp(String.raw`(?<![\p{L}\p{N}])${word}(?:\s+${wordOrInitial})+(?![\p{L}\p{N}])`, "giu"), placeholder);
+  const word = `(?:${words.map((w) => (w.length > 5 ? String.raw`${escapeRegExp(w.slice(0, 5))}\p{L}*` : escapeRegExp(w))).join("|")})`;
+  const initial = String.raw`(?:[${[...new Set(words.map((w) => w[0]))].map((c) => escapeRegExp(c ?? "")).join("")}]\.?)`;
+  const gap = String.raw`(?:[\s-]+(?:DE|DA|DO|DAS|DOS|E))?[\s-]+`;
+  const pattern = String.raw`(?<![\p{L}\p{N}])(?:(?:${initial}${gap})*${word}(?:${gap}(?:${word}|${initial}))+|(?:${initial}${gap})+${word})(?![\p{L}\p{N}])`;
+  return text
+    .normalize("NFD")
+    .replace(/\p{M}/gu, "")
+    .replace(new RegExp(pattern, "giu"), placeholder);
 }

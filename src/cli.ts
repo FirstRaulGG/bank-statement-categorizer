@@ -53,7 +53,8 @@ async function demo(): Promise<number> {
   const shownToModel = llm.calls.flatMap((call) => call.filter((message) => message.role === "user").map((message) => message.content));
   for (const message of shownToModel) out(message.split("\n").map((line) => `  ${line}`).join("\n"));
 
-  // The demo doubles as a check, and CI runs it.
+  // The demo doubles as a check, and CI runs it. It checks this statement: the names, documents
+  // and contact details that are in the example. It proves nothing about other statements.
   const transcript = normalizeName(llm.transcript());
   const leaks = [
     ...[HOLDER_CPF, FRIEND_CPF].filter((cpf) => transcript.includes(cpf) || digitsOf(transcript).includes(digitsOf(cpf))).map((cpf) => `a CPF (${cpf.slice(0, 3)}...)`),
@@ -81,17 +82,18 @@ async function demo(): Promise<number> {
     for (const [id] of wrong) out(`FAILED: ${id} was not decided as expected.`);
     return 1;
   }
-  out("Checks passed: no CPF, personal name or contact detail reached the model; transfers, the card bill,");
+  out("Checks passed: none of this statement's CPFs, personal names or contact details reached the model; transfers, the card bill,");
   out("the refund, the one-off payment and the injected instruction were each handled by code.");
   return 0;
 }
 
 function modelClient(provider: string, model: string | undefined): LlmClient {
-  if (provider === "anthropic") return new ClaudeClient(model ? { model } : {});
+  if (!model) throw new Error("name the model to evaluate with --model (or use --offline)");
+  if (provider === "anthropic") return new ClaudeClient({ model });
   if (provider === "openai-compatible") {
     const baseUrl = process.env.OPENAI_COMPAT_BASE_URL;
     const apiKey = process.env.OPENAI_COMPAT_API_KEY;
-    if (!baseUrl || !apiKey || !model) throw new Error("openai-compatible needs OPENAI_COMPAT_BASE_URL, OPENAI_COMPAT_API_KEY and --model");
+    if (!baseUrl || !apiKey) throw new Error("openai-compatible needs OPENAI_COMPAT_BASE_URL and OPENAI_COMPAT_API_KEY");
     return new OpenAiCompatibleClient({ baseUrl, apiKey, model, timeoutMs: 120_000 });
   }
   throw new Error(`unknown provider "${provider}"`);
@@ -108,7 +110,9 @@ async function evaluate(argv: string[]): Promise<number> {
       model: { type: "string" },
       compare: { type: "string" },
       "compare-provider": { type: "string" },
-      judge: { type: "boolean", default: false },
+      "judge-model": { type: "string" },
+      "judge-provider": { type: "string" },
+      "apply-at": { type: "string", default: "low" },
       prices: { type: "string" },
       "no-dictionary": { type: "boolean", default: false },
       json: { type: "boolean", default: false },
@@ -121,29 +125,42 @@ async function evaluate(argv: string[]): Promise<number> {
   const samples = Number(values.samples);
   if (!Number.isInteger(samples) || samples < 1 || samples > 9) throw new Error("--samples is an integer from 1 to 9");
 
-  const shared = { taxonomy: exampleTaxonomy, dictionary: values["no-dictionary"] ? [] : exampleDictionary, prices, samples };
-  const llm = values.offline ? offlineModel() : modelClient(values.provider, values.model);
-  const report = await runEval(cases, { ...shared, llm, ...(values.judge && !values.offline ? { judge: llm } : {}) });
-
-  if (values.offline) out("OFFLINE: answers come from a keyword stand-in. This exercises the harness; it measures no model.\n");
-  if (values.json) out(JSON.stringify(report, null, 2));
-  else out(formatEval(report, exampleTaxonomy));
-
-  if (values.compare && !values.offline) {
-    const other = await runEval(cases, { ...shared, llm: modelClient(values["compare-provider"] ?? values.provider, values.compare) });
-    out("\n--- comparison ---");
-    if (!values.json) out(`${formatEval(other, exampleTaxonomy)}\n`);
-    out(formatComparison(report, other, compareEvals(report, other)));
+  const applyAt = values["apply-at"];
+  if (applyAt !== "low" && applyAt !== "medium" && applyAt !== "high") throw new Error("--apply-at is low, medium or high");
+  if (values.offline && (values.compare || values["judge-model"] || values.model)) {
+    throw new Error("--offline measures no model: it cannot be combined with --model, --compare or --judge-model");
   }
-  return report.llmUnavailable ? 2 : 0;
+
+  const shared = { taxonomy: exampleTaxonomy, dictionary: values["no-dictionary"] ? [] : exampleDictionary, prices, samples, applyAt } as const;
+  const llm = values.offline ? offlineModel() : modelClient(values.provider, values.model);
+  const judge = values["judge-model"] ? modelClient(values["judge-provider"] ?? values.provider, values["judge-model"]) : undefined;
+  const report = await runEval(cases, { ...shared, llm, ...(judge ? { judge } : {}) });
+  const other = values.compare ? await runEval(cases, { ...shared, llm: modelClient(values["compare-provider"] ?? values.provider, values.compare) }) : null;
+  const comparison = other ? compareEvals(report, other) : null;
+
+  if (values.json) {
+    // One JSON document and nothing else, so the output can be piped.
+    out(JSON.stringify({ offline: values.offline, report, ...(other ? { compared: other, comparison } : {}) }, null, 2));
+  } else {
+    if (values.offline) out("OFFLINE: answers come from a keyword stand-in. This exercises the harness; it measures no model.\n");
+    if (judge && values["judge-model"] === values.model) out("WARNING: the judge is the model being evaluated. Its scores will flatter it.\n");
+    out(formatEval(report, exampleTaxonomy));
+    if (other && comparison) {
+      out("\n--- comparison ---");
+      out(`${formatEval(other, exampleTaxonomy)}\n`);
+      out(formatComparison(report, other, comparison));
+    }
+  }
+  // 2: some answers are missing because a provider was unreachable, so the figures are not comparable.
+  return report.llmUnavailable || other?.llmUnavailable || report.judge?.failed ? 2 : 0;
 }
 
 const [command, ...rest] = process.argv.slice(2);
 const run = command === "demo" ? demo() : command === "eval" ? evaluate(rest) : null;
 if (!run) {
   out("usage: ledger-agent demo | ledger-agent eval [--offline] [--golden file.json] [--samples n] [--provider anthropic|openai-compatible]");
-  out("                                             [--model id] [--compare id] [--compare-provider p] [--judge] [--prices prices.json]");
-  out("                                             [--no-dictionary] [--json]");
+  out("                                             [--model id] [--compare id] [--compare-provider p] [--judge-model id] [--judge-provider p]");
+  out("                                             [--apply-at low|medium|high] [--prices prices.json] [--no-dictionary] [--json]");
   process.exitCode = command ? 1 : 0;
 } else {
   run.then(

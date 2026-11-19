@@ -121,10 +121,18 @@ describe("history", () => {
     expect(lookup([row({})])).toMatchObject({ categoryId: "eating_out", confidence: "high", stage: "history" });
   });
 
-  it("needs two aged model answers, and then only reaches medium", () => {
+  it("needs model answers from two different days, and then only reaches medium", () => {
     const model = row({ source: "model", confidence: "high" });
     expect(lookup([model])).toBeNull();
-    expect(lookup([model, model])).toMatchObject({ confidence: "medium" });
+    // Ten rows of the same day are one answer about ten transactions.
+    expect(lookup(Array.from({ length: 10 }, () => model))).toBeNull();
+    expect(lookup([model, row({ source: "model", confidence: "medium", decidedAt: "2026-03-08" })])).toMatchObject({ confidence: "medium" });
+  });
+
+  it("counts a row whose date cannot be read for nothing", () => {
+    const bad = (decidedAt: string) => row({ source: "model", confidence: "high", decidedAt });
+    expect(lookup([bad("soon"), bad("2026-13-45")])).toBeNull();
+    expect(lookup([bad("not a date"), row({ source: "model", confidence: "high" })])).toBeNull();
   });
 
   it("ignores model answers that are fresh or were low confidence", () => {

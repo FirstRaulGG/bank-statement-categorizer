@@ -19,7 +19,8 @@ export interface HistoryOptions {
 
 interface Votes {
   manual: string[];
-  model: string[];
+  /** Category by the day it was decided: one vote per day, however many rows that day produced. */
+  model: Map<string, Set<string>>;
   vetoed: boolean;
 }
 
@@ -43,8 +44,10 @@ export interface HistoryIndex {
  * only manual choices count. A transfer on file for the key vetoes it: the same counterparty being
  * a transfer once and an expense another time is exactly the case that needs a person.
  *
- * The answer must be unanimous, from at least two rows or one manual row. It is `high` only when
- * every row behind it was a person's choice.
+ * The answer must be unanimous, from one manual row or from model answers given on at least two
+ * different days. Rows of the same day count once: a single reply about a group of ten
+ * transactions is one opinion, not ten. It is `high` only when every row behind it was a person's
+ * choice. A row whose date cannot be read counts for nothing.
  */
 export function buildHistory(past: readonly PastDecision[], taxonomy: Taxonomy, options: HistoryOptions): HistoryIndex {
   const minAge = options.minAgeDays ?? 7;
@@ -55,7 +58,7 @@ export function buildHistory(past: readonly PastDecision[], taxonomy: Taxonomy, 
     const category = taxonomy.get(row.categoryId);
     if (!category || !signAllows(category.role, row.direction)) continue;
     const key = `${row.anchor}#${row.direction}`;
-    const votes = index.get(key) ?? { manual: [], model: [], vetoed: false };
+    const votes = index.get(key) ?? { manual: [], model: new Map<string, Set<string>>(), vetoed: false };
     index.set(key, votes);
 
     if (category.role === "transfer") {
@@ -69,19 +72,23 @@ export function buildHistory(past: readonly PastDecision[], taxonomy: Taxonomy, 
     }
     if (row.anchor.startsWith("person:")) continue;
     if (row.confidence !== "high" && row.confidence !== "medium") continue;
-    if (daysBetween(row.decidedAt, options.today) < minAge) continue;
-    votes.model.push(category.id);
+    const age = daysBetween(row.decidedAt, options.today);
+    if (!(age >= minAge)) continue;
+    const day = votes.model.get(row.decidedAt) ?? new Set<string>();
+    day.add(category.id);
+    votes.model.set(row.decidedAt, day);
   }
 
   return {
     lookup(anchor, direction) {
       const votes = index.get(`${anchor}#${direction}`);
       if (!votes || votes.vetoed) return null;
-      const all = [...votes.manual, ...votes.model];
-      if (votes.manual.length < 1 && all.length < 2) return null;
+      const model = [...votes.model.values()].flatMap((day) => [...day]);
+      const all = [...votes.manual, ...model];
+      if (votes.manual.length < 1 && votes.model.size < 2) return null;
       const categoryId = all[0]!;
       if (all.some((id) => id !== categoryId)) return null;
-      const confidence: Confidence = votes.model.length === 0 ? "high" : "medium";
+      const confidence: Confidence = votes.model.size === 0 ? "high" : "medium";
       return {
         categoryId,
         confidence,

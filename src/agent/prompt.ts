@@ -6,6 +6,7 @@
 
 import { formatCnpj, redactName, scrub } from "../core/pii.js";
 import { normalizeName } from "../core/taxonomy.js";
+import { modelMayChoose } from "./decide.js";
 import type { Taxonomy } from "../core/taxonomy.js";
 import { formatCents } from "../core/types.js";
 import type { LlmMessage } from "../llm/types.js";
@@ -14,7 +15,10 @@ import type { Group } from "./group.js";
 export const HOLDER_PLACEHOLDER = "[ACCOUNT HOLDER]";
 
 export interface PromptOptions {
-  /** One or two sentences about whose statement this is ("a salaried employee", "a freelancer"). No names. */
+  /**
+   * One or two sentences about whose statement this is ("a salaried employee", "a freelancer").
+   * It is sent to the model after the same scrubbing as a statement line, on one line.
+   */
   context?: string;
   maskCompanyIds?: boolean;
 }
@@ -36,19 +40,22 @@ export interface PromptGroup {
   company?: string;
 }
 
-export function systemPrompt(taxonomy: Taxonomy, options: PromptOptions = {}): string {
+export function systemPrompt(taxonomy: Taxonomy, options: PromptOptions = {}, holderName = ""): string {
+  // Only what the model is allowed to answer with. What it cannot choose, it is not shown.
   const categories = taxonomy.categories
+    .filter((category) => modelMayChoose(taxonomy, category.id))
     .map((category) => `${category.id} | ${category.name} | ${category.role}${category.hint ? ` | ${category.hint}` : ""}`)
     .join("\n");
 
   return [
     "You categorize transactions from a Brazilian bank statement for a personal budget.",
-    options.context ? `About the account holder: ${options.context}` : "",
+    options.context ? `About the account holder: ${visibleText(options.context, holderName, options).replace(/\s+/g, " ").trim().slice(0, 500)}` : "",
     "",
     "Each input line is one GROUP: every transaction with the same counterparty in the same direction. Decide one category per group.",
     "",
     "Rules:",
     "1. Choose a category id from the list below. Never invent one. Repeat the category's exact name in categoryName.",
+    "   Transfers between the holder's own accounts and card bill payments are settled before you are asked. They are not in the list and are not yours to assign.",
     "2. Direction binds: money coming in is never an expense, money going out is never income.",
     "3. A refund or reversal (ESTORNO, REEMBOLSO, DEVOLUCAO) is money coming back. It is not income.",
     "4. `hint` is a keyword rule's guess. Use it as evidence, not as the answer.",
