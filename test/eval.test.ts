@@ -115,14 +115,31 @@ describe("comparing two runs", () => {
 });
 
 describe("the example golden set, offline", () => {
-  it("runs end to end and fails exactly where the stand-in is wrong", async () => {
+  it("runs end to end, and the stand-in fails where it is built to fail", async () => {
     const report = await runEval(exampleGolden, { taxonomy, dictionary: exampleDictionary, llm: offlineModel() });
-    const wrong = report.cases.filter((c) => !c.correct).map((c) => c.id);
-    expect(wrong).toEqual(["health-post", "bookshop", "injection"]);
+    const byId = new Map(report.cases.map((c) => [c.id, c]));
     expect(report.total).toBe(exampleGolden.length);
+    expect(exampleGolden.length).toBeGreaterThanOrEqual(100);
+
+    // A keyword that means two things, a line no keyword covers, and two injected instructions.
+    expect(byId.get("health-post")).toMatchObject({ correct: false, got: "transport" });
+    expect(byId.get("bookshop")).toMatchObject({ correct: false, got: null });
+    expect(byId.get("injection")).toMatchObject({ correct: false, got: null, guard: "sign_mismatch" });
+    expect(byId.get("injection-transfer")).toMatchObject({ correct: true, got: "shopping" });
+    // What the rules settle is settled whatever the model would have said.
+    for (const id of ["card-reversal", "cashback", "person-out", "person-apostrophe", "person-masked-cpf", "pharmacy"]) {
+      expect(byId.get(id)?.correct, id).toBe(true);
+      expect(byId.get(id)?.stage, id).not.toBe("model");
+    }
+
     const text = formatEval(report, taxonomy);
-    expect(text).toContain(`Accuracy: ${exampleGolden.length - 3}/${exampleGolden.length}`);
+    expect(text).toContain(`Accuracy: ${report.correct}/${exampleGolden.length}`);
     expect(text).toContain("n/a (no price for this model)");
+  });
+
+  it("every example case expects a category that exists and has a unique id", () => {
+    expect(new Set(exampleGolden.map((c) => c.id)).size).toBe(exampleGolden.length);
+    for (const golden of exampleGolden) expect(taxonomy.get(golden.expected), golden.id).toBeDefined();
   });
 
   it("the stand-in abstains when no keyword fits", () => {

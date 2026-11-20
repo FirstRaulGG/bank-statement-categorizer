@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// ledger-agent demo                 run the example statement through the pipeline, offline
-// ledger-agent eval [options]       run a golden set and print the report
+// bank-statement-categorizer demo                 run the example statement through the pipeline, offline
+// bank-statement-categorizer eval [options]       run a golden set and print the report
 
 import { readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
@@ -158,7 +158,7 @@ async function evaluate(argv: string[]): Promise<number> {
 const [command, ...rest] = process.argv.slice(2);
 const run = command === "demo" ? demo() : command === "eval" ? evaluate(rest) : null;
 if (!run) {
-  out("usage: ledger-agent demo | ledger-agent eval [--offline] [--golden file.json] [--samples n] [--provider anthropic|openai-compatible]");
+  out("usage: bank-statement-categorizer demo | bank-statement-categorizer eval [--offline] [--golden file.json] [--samples n] [--provider anthropic|openai-compatible]");
   out("                                             [--model id] [--compare id] [--compare-provider p] [--judge-model id] [--judge-provider p]");
   out("                                             [--apply-at low|medium|high] [--prices prices.json] [--no-dictionary] [--json]");
   process.exitCode = command ? 1 : 0;

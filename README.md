@@ -1,4 +1,4 @@
-# ledger-agent
+# bank-statement-categorizer
 
 An LLM agent that puts a category on each line of a Brazilian bank statement (Pix, boleto, card), built on one rule: **the model proposes, code decides, and identifiers are stripped before the model reads a line.**
 
@@ -14,7 +14,7 @@ npm run eval -- --offline
 
 Early. Read this before relying on it.
 
-- **Not run in production in this form.** The logic is covered by 208 tests and by a demo that checks its own output, all against a scripted stand-in for the model.
+- **Not run in production in this form.** The logic is covered by 209 tests and by a demo that checks its own output, all against a scripted stand-in for the model.
 - **No real model has been evaluated with it yet.** There are no accuracy or cost figures in this README because none have been measured. The `--offline` eval exercises the harness with a keyword stand-in and says nothing about any model.
 - **The Claude and OpenAI-compatible adapters have only been tested against stubs**, never against the live APIs.
 - **The privacy measures are a best effort, not a guarantee.** Identifiers are matched by shape and people are recognised by heuristics. The [limits](#limits) list what gets through.
@@ -123,9 +123,9 @@ A golden set is a list of statement lines with the category a person chose:
 ```
 
 ```
-npx ledger-agent eval --golden my-cases.json --model <model-id> --samples 3 --prices prices.json
-npx ledger-agent eval --golden my-cases.json --model <model-a> --compare <model-b>
-npx ledger-agent eval --golden my-cases.json --model <model-a> --judge-model <model-c>
+npx bank-statement-categorizer eval --golden my-cases.json --model <model-id> --samples 3 --prices prices.json
+npx bank-statement-categorizer eval --golden my-cases.json --model <model-a> --compare <model-b>
+npx bank-statement-categorizer eval --golden my-cases.json --model <model-a> --judge-model <model-c>
 ```
 
 It runs the cases through the real pipeline (same passes, parser and guards) and reports:
@@ -146,12 +146,12 @@ How to read it:
 - "Cost per 1,000 golden cases" counts a case as one counterparty, and cases settled by rules cost nothing. It is not cost per 1,000 transactions.
 - Exit code 2 means a provider was unreachable for part of the run and the figures are not comparable.
 
-The CLI uses the example category list in [`src/example`](src/example). For your own, call `runEval` from code. The bundled 24-case set shows the format; it is far too small and too tidy to rank models with.
+The CLI uses the example category list in [`src/example`](src/example). For your own, call `runEval` from code. The bundled set of 106 synthetic cases shows the format and exercises the pipeline. Its lines and its labels were written by the same author, so it is too tidy to rank models with: build your own from lines your users confirmed.
 
 ## Using it
 
 ```ts
-import { ClaudeClient, categorize, defineTaxonomy, toHistory } from "ledger-agent";
+import { ClaudeClient, categorize, defineTaxonomy, toHistory } from "bank-statement-categorizer";
 
 const taxonomy = defineTaxonomy({ categories, special: { ownTransfer: "own_transfer", cardBill: "card_bill" } });
 

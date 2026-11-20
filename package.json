@@ -1,23 +1,23 @@
 {
-  "name": "ledger-agent",
+  "name": "bank-statement-categorizer",
   "version": "0.1.0",
   "description": "An LLM agent that categorizes Brazilian bank transactions (Pix, boleto, card). Deterministic passes first, the model only for what is left, guards after it, and a golden-set eval to compare prompts and models.",
   "license": "MIT",
   "author": "Raul Gomes",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/FirstRaulGG/ledger-agent.git"
+    "url": "git+https://github.com/FirstRaulGG/bank-statement-categorizer.git"
   },
-  "homepage": "https://github.com/FirstRaulGG/ledger-agent#readme",
+  "homepage": "https://github.com/FirstRaulGG/bank-statement-categorizer#readme",
   "bugs": {
-    "url": "https://github.com/FirstRaulGG/ledger-agent/issues"
+    "url": "https://github.com/FirstRaulGG/bank-statement-categorizer/issues"
   },
   "type": "module",
   "engines": {
     "node": ">=22"
   },
   "bin": {
-    "ledger-agent": "dist/cli.js"
+    "bank-statement-categorizer": "dist/cli.js"
   },
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
